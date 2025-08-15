@@ -9,6 +9,8 @@
 (define-constant err-already-exists (err u107))
 (define-constant err-invalid-amount (err u108))
 (define-constant err-cannot-cancel (err u109))
+(define-constant err-invalid-partial-amount (err u110))
+(define-constant err-insufficient-remaining-balance (err u111))
 
 (define-data-var escrow-counter uint u0)
 
@@ -44,6 +46,15 @@
 (define-map user-escrows
   principal
   (list 100 uint)
+)
+
+(define-map partial-releases
+  uint
+  (list 50 {
+    amount: uint,
+    released-at: uint,
+    released-by: principal
+  })
 )
 
 (define-public (create-escrow 
@@ -272,4 +283,47 @@
           (some u0)))
     none
   )
+)
+
+(define-public (release-partial-payment (escrow-id uint) (partial-amount uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+      (escrow-balance (unwrap! (map-get? escrow-balances escrow-id) err-not-found))
+      (current-height burn-block-height)
+      (current-releases (default-to (list) (map-get? partial-releases escrow-id)))
+    )
+    (asserts! (is-eq tx-sender (get buyer escrow-data)) err-unauthorized)
+    (asserts! (is-eq (get status escrow-data) "active") err-invalid-status)
+    (asserts! (> partial-amount u0) err-invalid-partial-amount)
+    (asserts! (<= partial-amount escrow-balance) err-insufficient-remaining-balance)
+    
+    (try! (as-contract (stx-transfer? partial-amount tx-sender (get supplier escrow-data))))
+    
+    (map-set partial-releases escrow-id
+      (unwrap! (as-max-len?
+        (append current-releases {
+          amount: partial-amount,
+          released-at: current-height,
+          released-by: tx-sender
+        })
+        u50)
+        err-invalid-partial-amount))
+    
+    (map-set escrow-balances escrow-id (- escrow-balance partial-amount))
+    
+    (ok partial-amount)
+  )
+)
+
+(define-read-only (get-partial-releases (escrow-id uint))
+  (default-to (list) (map-get? partial-releases escrow-id))
+)
+
+(define-read-only (get-total-released (escrow-id uint))
+  (fold calculate-total-released (default-to (list) (map-get? partial-releases escrow-id)) u0)
+)
+
+(define-private (calculate-total-released (release {amount: uint, released-at: uint, released-by: principal}) (total uint))
+  (+ total (get amount release))
 )
