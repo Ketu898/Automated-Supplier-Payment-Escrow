@@ -11,8 +11,13 @@
 (define-constant err-cannot-cancel (err u109))
 (define-constant err-invalid-partial-amount (err u110))
 (define-constant err-insufficient-remaining-balance (err u111))
+(define-constant err-reputation-not-found (err u112))
+(define-constant err-no-escrows-completed (err u113))
 
 (define-data-var escrow-counter uint u0)
+(define-data-var on-time-delivery-bonus uint u10)
+(define-data-var dispute-penalty int -20)
+(define-data-var successful-escrow-bonus uint u5)
 
 (define-map escrows 
   uint 
@@ -57,6 +62,37 @@
   })
 )
 
+(define-map supplier-reputation
+  principal
+  {
+    total-escrows: uint,
+    successful-escrows: uint,
+    disputed-escrows: uint,
+    on-time-deliveries: uint,
+    total-volume: uint,
+    reputation-score: int,
+    last-updated: uint
+  }
+)
+
+(define-map reputation-history
+  { supplier: principal, escrow-id: uint }
+  {
+    score-change: int,
+    event-type: (string-ascii 30),
+    timestamp: uint
+  }
+)
+
+(define-map supplier-tier
+  principal
+  {
+    tier: uint,
+    tier-name: (string-ascii 20),
+    unlocked-at: uint
+  }
+)
+
 (define-public (create-escrow 
   (supplier principal) 
   (description (string-ascii 500)) 
@@ -99,6 +135,19 @@
         (append (default-to (list) (map-get? user-escrows supplier)) escrow-id) 
         u100) 
         err-invalid-amount))
+    
+    (if (is-none (map-get? supplier-reputation supplier))
+      (map-set supplier-reputation supplier 
+        {
+          total-escrows: u0,
+          successful-escrows: u0,
+          disputed-escrows: u0,
+          on-time-deliveries: u0,
+          total-volume: u0,
+          reputation-score: 0,
+          last-updated: burn-block-height
+        })
+      true)
     
     (var-set escrow-counter escrow-id)
     (ok escrow-id)
@@ -153,6 +202,8 @@
     
     (map-set escrow-balances escrow-id u0)
     
+    (try! (update-supplier-reputation (get supplier escrow-data) escrow-id "success"))
+    
     (ok escrow-balance)
   )
 )
@@ -195,6 +246,8 @@
     (map-set escrows escrow-id (merge escrow-data {
       status: "disputed"
     }))
+    
+    (try! (update-supplier-reputation (get supplier escrow-data) escrow-id "dispute"))
     
     (ok true)
   )
@@ -326,4 +379,134 @@
 
 (define-private (calculate-total-released (release {amount: uint, released-at: uint, released-by: principal}) (total uint))
   (+ total (get amount release))
+)
+
+(define-private (update-supplier-reputation (supplier principal) (escrow-id uint) (event-type (string-ascii 30)))
+  (let
+    (
+      (reputation (unwrap! (map-get? supplier-reputation supplier) err-reputation-not-found))
+      (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+      (score-change (get-score-change event-type escrow-data))
+      (new-score (+ (get reputation-score reputation) score-change))
+      (is-on-time (is-on-time-delivery escrow-data))
+    )
+    (map-set supplier-reputation supplier 
+      (merge reputation {
+        total-escrows: (+ (get total-escrows reputation) u1),
+        successful-escrows: (if (is-eq event-type "success") (+ (get successful-escrows reputation) u1) (get successful-escrows reputation)),
+        disputed-escrows: (if (is-eq event-type "dispute") (+ (get disputed-escrows reputation) u1) (get disputed-escrows reputation)),
+        on-time-deliveries: (if is-on-time (+ (get on-time-deliveries reputation) u1) (get on-time-deliveries reputation)),
+        total-volume: (+ (get total-volume reputation) (get amount escrow-data)),
+        reputation-score: new-score,
+        last-updated: burn-block-height
+      }))
+    
+    (map-set reputation-history { supplier: supplier, escrow-id: escrow-id } {
+      score-change: score-change,
+      event-type: event-type,
+      timestamp: burn-block-height
+    })
+    
+    (unwrap-panic (update-supplier-tier supplier new-score))
+    (ok true)
+  )
+)
+
+(define-private (get-score-change (event-type (string-ascii 30)) (escrow-data {buyer: principal, supplier: principal, amount: uint, description: (string-ascii 500), status: (string-ascii 20), created-at: uint, delivery-deadline: uint, delivery-confirmed-at: (optional uint), cancelled-at: (optional uint)}))
+  (if (is-eq event-type "success")
+    (if (is-on-time-delivery escrow-data)
+      (to-int (+ (var-get successful-escrow-bonus) (var-get on-time-delivery-bonus)))
+      (to-int (var-get successful-escrow-bonus)))
+    (if (is-eq event-type "dispute")
+      (var-get dispute-penalty)
+      0
+    )
+  )
+)
+
+(define-private (is-on-time-delivery (escrow-data {buyer: principal, supplier: principal, amount: uint, description: (string-ascii 500), status: (string-ascii 20), created-at: uint, delivery-deadline: uint, delivery-confirmed-at: (optional uint), cancelled-at: (optional uint)}))
+  (match (get delivery-confirmed-at escrow-data)
+    confirmed-at (<= confirmed-at (get delivery-deadline escrow-data))
+    false
+  )
+)
+
+(define-private (update-supplier-tier (supplier principal) (score int))
+  (let
+    (
+      (current-tier (default-to { tier: u0, tier-name: "Bronze", unlocked-at: u0 } (map-get? supplier-tier supplier)))
+      (new-tier (get-new-tier score))
+    )
+    (if (> (get tier new-tier) (get tier current-tier))
+      (begin (map-set supplier-tier supplier new-tier) (ok true))
+      (ok true))
+  )
+)
+
+(define-private (get-new-tier (score int))
+  (if (>= score 100)
+    { tier: u3, tier-name: "Platinum", unlocked-at: burn-block-height }
+    (if (>= score 50)
+      { tier: u2, tier-name: "Gold", unlocked-at: burn-block-height }
+      (if (>= score 10)
+        { tier: u1, tier-name: "Silver", unlocked-at: burn-block-height }
+        { tier: u0, tier-name: "Bronze", unlocked-at: burn-block-height }
+      )
+    )
+  )
+)
+
+(define-public (set-reputation-parameters (on-time-bonus uint) (dispute-penalty-val int) (success-bonus uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> on-time-bonus u0) err-invalid-amount)
+    (asserts! (< dispute-penalty-val 0) err-invalid-amount)
+    (asserts! (> success-bonus u0) err-invalid-amount)
+    
+    (var-set on-time-delivery-bonus on-time-bonus)
+    (var-set dispute-penalty dispute-penalty-val)
+    (var-set successful-escrow-bonus success-bonus)
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-supplier-reputation (supplier principal))
+  (map-get? supplier-reputation supplier)
+)
+
+(define-read-only (get-supplier-tier (supplier principal))
+  (default-to 
+    { tier: u0, tier-name: "Bronze", unlocked-at: u0 }
+    (map-get? supplier-tier supplier)
+  )
+)
+
+(define-read-only (get-reputation-history (supplier principal) (escrow-id uint))
+  (map-get? reputation-history { supplier: supplier, escrow-id: escrow-id })
+)
+
+(define-read-only (calculate-reliability-score (supplier principal))
+  (match (map-get? supplier-reputation supplier)
+    reputation
+      (let
+        (
+          (total (get total-escrows reputation))
+          (successful (get successful-escrows reputation))
+        )
+        (if (> total u0)
+          (some (/ (* successful u100) total))
+          (some u0)
+        )
+      )
+    none
+  )
+)
+
+(define-read-only (get-reputation-parameters)
+  {
+    on-time-bonus: (var-get on-time-delivery-bonus),
+    dispute-penalty: (var-get dispute-penalty),
+    success-bonus: (var-get successful-escrow-bonus)
+  }
 )
