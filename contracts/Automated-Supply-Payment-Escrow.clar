@@ -13,6 +13,10 @@
 (define-constant err-insufficient-remaining-balance (err u111))
 (define-constant err-reputation-not-found (err u112))
 (define-constant err-no-escrows-completed (err u113))
+(define-constant err-milestone-not-found (err u114))
+(define-constant err-milestone-already-completed (err u115))
+(define-constant err-all-milestones-not-completed (err u116))
+(define-constant err-invalid-milestone-count (err u117))
 
 (define-data-var escrow-counter uint u0)
 (define-data-var on-time-delivery-bonus uint u10)
@@ -91,6 +95,17 @@
     tier-name: (string-ascii 20),
     unlocked-at: uint
   }
+)
+
+(define-map escrow-milestones
+  uint
+  (list 10 {
+    milestone-id: uint,
+    description: (string-ascii 200),
+    payment-percentage: uint,
+    completed: bool,
+    completed-at: (optional uint)
+  })
 )
 
 (define-public (create-escrow 
@@ -509,4 +524,197 @@
     dispute-penalty: (var-get dispute-penalty),
     success-bonus: (var-get successful-escrow-bonus)
   }
+)
+
+(define-public (create-milestone-based-escrow 
+  (supplier principal) 
+  (description (string-ascii 500)) 
+  (delivery-days uint)
+  (milestones (list 10 { description: (string-ascii 200), payment-percentage: uint })))
+  (let
+    (
+      (escrow-id (+ (var-get escrow-counter) u1))
+      (amount (stx-get-balance tx-sender))
+      (current-height burn-block-height)
+      (deadline (+ current-height (* delivery-days u144)))
+      (total-percentage (fold sum-percentages milestones u0))
+    )
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> delivery-days u0) err-invalid-amount)
+    (asserts! (not (is-eq tx-sender supplier)) err-unauthorized)
+    (asserts! (> (len milestones) u0) err-invalid-milestone-count)
+    (asserts! (is-eq total-percentage u100) err-invalid-amount)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrows escrow-id {
+      buyer: tx-sender,
+      supplier: supplier,
+      amount: amount,
+      description: description,
+      status: "active",
+      created-at: current-height,
+      delivery-deadline: deadline,
+      delivery-confirmed-at: none,
+      cancelled-at: none
+    })
+    
+    (map-set escrow-balances escrow-id amount)
+    
+    (map-set user-escrows tx-sender 
+      (unwrap! (as-max-len? 
+        (append (default-to (list) (map-get? user-escrows tx-sender)) escrow-id) 
+        u100) 
+        err-invalid-amount))
+    
+    (map-set user-escrows supplier
+      (unwrap! (as-max-len? 
+        (append (default-to (list) (map-get? user-escrows supplier)) escrow-id) 
+        u100) 
+        err-invalid-amount))
+    
+    (map-set escrow-milestones escrow-id
+      (create-milestone-list milestones u0))
+    
+    (if (is-none (map-get? supplier-reputation supplier))
+      (map-set supplier-reputation supplier 
+        {
+          total-escrows: u0,
+          successful-escrows: u0,
+          disputed-escrows: u0,
+          on-time-deliveries: u0,
+          total-volume: u0,
+          reputation-score: 0,
+          last-updated: burn-block-height
+        })
+      true)
+    
+    (var-set escrow-counter escrow-id)
+    (ok escrow-id)
+  )
+)
+
+(define-public (complete-milestone (escrow-id uint) (milestone-id uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+      (milestones (unwrap! (map-get? escrow-milestones escrow-id) err-milestone-not-found))
+      (escrow-balance (unwrap! (map-get? escrow-balances escrow-id) err-not-found))
+      (milestone (unwrap! (element-at milestones milestone-id) err-milestone-not-found))
+      (current-height burn-block-height)
+      (payment-amount (/ (* (get amount escrow-data) (get payment-percentage milestone)) u100))
+    )
+    (asserts! (is-eq tx-sender (get buyer escrow-data)) err-unauthorized)
+    (asserts! (is-eq (get status escrow-data) "active") err-invalid-status)
+    (asserts! (not (get completed milestone)) err-milestone-already-completed)
+    (asserts! (<= payment-amount escrow-balance) err-insufficient-funds)
+    
+    (try! (as-contract (stx-transfer? payment-amount tx-sender (get supplier escrow-data))))
+    
+    (map-set escrow-milestones escrow-id
+      (unwrap! (as-max-len?
+        (map update-milestone-status 
+          milestones
+          (list 
+            { target-id: milestone-id, current-id: u0, current-height: current-height }
+            { target-id: milestone-id, current-id: u1, current-height: current-height }
+            { target-id: milestone-id, current-id: u2, current-height: current-height }
+            { target-id: milestone-id, current-id: u3, current-height: current-height }
+            { target-id: milestone-id, current-id: u4, current-height: current-height }
+            { target-id: milestone-id, current-id: u5, current-height: current-height }
+            { target-id: milestone-id, current-id: u6, current-height: current-height }
+            { target-id: milestone-id, current-id: u7, current-height: current-height }
+            { target-id: milestone-id, current-id: u8, current-height: current-height }
+            { target-id: milestone-id, current-id: u9, current-height: current-height }))
+        u10)
+        err-milestone-not-found))
+    
+    (map-set escrow-balances escrow-id (- escrow-balance payment-amount))
+    
+    (if (all-milestones-completed escrow-id)
+      (begin
+        (map-set escrows escrow-id (merge escrow-data { status: "completed" }))
+        (try! (update-supplier-reputation (get supplier escrow-data) escrow-id "success"))
+        (ok payment-amount))
+      (ok payment-amount))
+  )
+)
+
+(define-read-only (get-escrow-milestones (escrow-id uint))
+  (map-get? escrow-milestones escrow-id)
+)
+
+(define-read-only (get-milestone-progress (escrow-id uint))
+  (match (map-get? escrow-milestones escrow-id)
+    milestones
+      (let
+        (
+          (total-milestones (len milestones))
+          (completed-count (fold count-completed-milestones milestones u0))
+        )
+        (some {
+          total: total-milestones,
+          completed: completed-count,
+          percentage: (if (> total-milestones u0) (/ (* completed-count u100) total-milestones) u0)
+        })
+      )
+    none
+  )
+)
+
+(define-private (sum-percentages (milestone { description: (string-ascii 200), payment-percentage: uint }) (total uint))
+  (+ total (get payment-percentage milestone))
+)
+
+(define-private (create-milestone-list (milestones (list 10 { description: (string-ascii 200), payment-percentage: uint })) (counter uint))
+  (map create-milestone-item 
+    milestones
+    (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9))
+)
+
+(define-private (create-milestone-item 
+  (milestone { description: (string-ascii 200), payment-percentage: uint })
+  (id uint))
+  {
+    milestone-id: id,
+    description: (get description milestone),
+    payment-percentage: (get payment-percentage milestone),
+    completed: false,
+    completed-at: none
+  }
+)
+
+(define-private (update-milestone-status 
+  (milestone { milestone-id: uint, description: (string-ascii 200), payment-percentage: uint, completed: bool, completed-at: (optional uint) })
+  (context { target-id: uint, current-id: uint, current-height: uint }))
+  (if (is-eq (get milestone-id milestone) (get target-id context))
+    (merge milestone { 
+      completed: true, 
+      completed-at: (some (get current-height context)) 
+    })
+    milestone
+  )
+)
+
+(define-private (count-completed-milestones 
+  (milestone { milestone-id: uint, description: (string-ascii 200), payment-percentage: uint, completed: bool, completed-at: (optional uint) })
+  (count uint))
+  (if (get completed milestone)
+    (+ count u1)
+    count
+  )
+)
+
+(define-private (all-milestones-completed (escrow-id uint))
+  (match (map-get? escrow-milestones escrow-id)
+    milestones
+      (let
+        (
+          (total (len milestones))
+          (completed (fold count-completed-milestones milestones u0))
+        )
+        (is-eq total completed)
+      )
+    false
+  )
 )
