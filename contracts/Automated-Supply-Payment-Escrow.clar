@@ -17,8 +17,13 @@
 (define-constant err-milestone-already-completed (err u115))
 (define-constant err-all-milestones-not-completed (err u116))
 (define-constant err-invalid-milestone-count (err u117))
+(define-constant err-dispute-already-exists (err u118))
+(define-constant err-dispute-not-found (err u119))
+(define-constant err-dispute-already-resolved (err u120))
+(define-constant err-invalid-resolution (err u121))
 
 (define-data-var escrow-counter uint u0)
+(define-data-var dispute-counter uint u0)
 (define-data-var on-time-delivery-bonus uint u10)
 (define-data-var dispute-penalty int -20)
 (define-data-var successful-escrow-bonus uint u5)
@@ -106,6 +111,29 @@
     completed: bool,
     completed-at: (optional uint)
   })
+)
+
+(define-map escrow-disputes
+  uint
+  {
+    dispute-id: uint,
+    escrow-id: uint,
+    initiator: principal,
+    reason: (string-ascii 500),
+    buyer-evidence: (string-ascii 500),
+    supplier-evidence: (string-ascii 500),
+    status: (string-ascii 20),
+    resolution: (string-ascii 20),
+    buyer-refund-percentage: uint,
+    created-at: uint,
+    resolved-at: (optional uint),
+    resolved-by: (optional principal)
+  }
+)
+
+(define-map dispute-by-escrow
+  uint
+  uint
 )
 
 (define-public (create-escrow 
@@ -717,4 +745,121 @@
       )
     false
   )
+)
+
+(define-public (raise-dispute (escrow-id uint) (reason (string-ascii 500)) (evidence (string-ascii 500)))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+      (dispute-id (+ (var-get dispute-counter) u1))
+      (current-height burn-block-height)
+      (is-buyer (is-eq tx-sender (get buyer escrow-data)))
+      (is-supplier (is-eq tx-sender (get supplier escrow-data)))
+    )
+    (asserts! (or is-buyer is-supplier) err-unauthorized)
+    (asserts! (is-eq (get status escrow-data) "active") err-invalid-status)
+    (asserts! (is-none (map-get? dispute-by-escrow escrow-id)) err-dispute-already-exists)
+    
+    (map-set escrow-disputes dispute-id {
+      dispute-id: dispute-id,
+      escrow-id: escrow-id,
+      initiator: tx-sender,
+      reason: reason,
+      buyer-evidence: (if is-buyer evidence ""),
+      supplier-evidence: (if is-supplier evidence ""),
+      status: "pending",
+      resolution: "",
+      buyer-refund-percentage: u0,
+      created-at: current-height,
+      resolved-at: none,
+      resolved-by: none
+    })
+    
+    (map-set dispute-by-escrow escrow-id dispute-id)
+    
+    (map-set escrows escrow-id (merge escrow-data { status: "disputed" }))
+    
+    (var-set dispute-counter dispute-id)
+    (ok dispute-id)
+  )
+)
+
+(define-public (submit-dispute-evidence (escrow-id uint) (evidence (string-ascii 500)))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+      (dispute-id (unwrap! (map-get? dispute-by-escrow escrow-id) err-dispute-not-found))
+      (dispute-data (unwrap! (map-get? escrow-disputes dispute-id) err-dispute-not-found))
+      (is-buyer (is-eq tx-sender (get buyer escrow-data)))
+      (is-supplier (is-eq tx-sender (get supplier escrow-data)))
+    )
+    (asserts! (or is-buyer is-supplier) err-unauthorized)
+    (asserts! (is-eq (get status dispute-data) "pending") err-dispute-already-resolved)
+    
+    (map-set escrow-disputes dispute-id 
+      (merge dispute-data {
+        buyer-evidence: (if is-buyer evidence (get buyer-evidence dispute-data)),
+        supplier-evidence: (if is-supplier evidence (get supplier-evidence dispute-data))
+      }))
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute-with-split (escrow-id uint) (buyer-refund-percentage uint))
+  (let
+    (
+      (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+      (dispute-id (unwrap! (map-get? dispute-by-escrow escrow-id) err-dispute-not-found))
+      (dispute-data (unwrap! (map-get? escrow-disputes dispute-id) err-dispute-not-found))
+      (escrow-balance (unwrap! (map-get? escrow-balances escrow-id) err-not-found))
+      (current-height burn-block-height)
+      (buyer-amount (/ (* escrow-balance buyer-refund-percentage) u100))
+      (supplier-amount (- escrow-balance buyer-amount))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get status dispute-data) "pending") err-dispute-already-resolved)
+    (asserts! (<= buyer-refund-percentage u100) err-invalid-resolution)
+    (asserts! (> escrow-balance u0) err-insufficient-funds)
+    
+    (if (> buyer-amount u0)
+      (try! (as-contract (stx-transfer? buyer-amount tx-sender (get buyer escrow-data))))
+      true)
+    
+    (if (> supplier-amount u0)
+      (try! (as-contract (stx-transfer? supplier-amount tx-sender (get supplier escrow-data))))
+      true)
+    
+    (map-set escrow-disputes dispute-id 
+      (merge dispute-data {
+        status: "resolved",
+        resolution: (if (is-eq buyer-refund-percentage u100) "buyer-favor" 
+                     (if (is-eq buyer-refund-percentage u0) "supplier-favor" "split")),
+        buyer-refund-percentage: buyer-refund-percentage,
+        resolved-at: (some current-height),
+        resolved-by: (some tx-sender)
+      }))
+    
+    (map-set escrows escrow-id (merge escrow-data { status: "resolved" }))
+    (map-set escrow-balances escrow-id u0)
+    
+    (try! (update-supplier-reputation (get supplier escrow-data) escrow-id "dispute"))
+    
+    (ok { buyer-refund: buyer-amount, supplier-payment: supplier-amount })
+  )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? escrow-disputes dispute-id)
+)
+
+(define-read-only (get-dispute-by-escrow (escrow-id uint))
+  (match (map-get? dispute-by-escrow escrow-id)
+    dispute-id (map-get? escrow-disputes dispute-id)
+    none
+  )
+)
+
+(define-read-only (get-dispute-counter)
+  (var-get dispute-counter)
 )
